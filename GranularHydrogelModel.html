@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Granular Hydrogel Scaffold — First-Draft Model</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #root { min-height: 100%; }
+  </style>
+
+  <!-- React + ReactDOM (production UMD builds) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel Standalone: transpiles the JSX below in the browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+const { useMemo, useState } = React;
+
+/**
+ * Granular Hydrogel Scaffold — first-draft characterization model
+ * ---------------------------------------------------------------
+ * STRUCTURAL module  (Riley et al., Small 2023, "Void Volume Fraction of Granular Scaffolds")
+ *   - void volume fraction (VVF) by packing type + particle shape
+ *   - particle count, void volume, surface area, rough pore size
+ *   - polydispersity via the 3rd moment of a normal diameter distribution
+ *
+ * FUNCTIONAL module  (Brown & McShane, Biosens. Bioelectron. 2006, single microsphere)
+ *   - steady-state reaction–diffusion of a substrate inside one spherical particle
+ *   - Thiele modulus, effectiveness factor, penetration depth, response time
+ *   - exact first-order analytical radial profile (no PDE solver needed)
+ *
+ * Everything is deliberately transparent and adjustable — this is a scaffold to build on,
+ * not a finished tool. Assumptions are called out in the notes.
+ */
+
+// ---------- palette (confocal-fluorescence inspired) ----------
+const C = {
+  paper: "#EBEEE8",
+  panel: "#F4F6F1",
+  ink: "#171B18",
+  sub: "#5E675E",
+  line: "#CAD1C6",
+  dark: "#0A0E0C",       // "microscope viewport"
+  green: "#4FE3A0",      // reference-fluorophore / particle edge
+  magenta: "#F65C93",    // O2 indicator / void
+  amber: "#F2B84B",
+};
+
+// ---------- reference data from Riley et al. ----------
+const VVF_TABLE = {
+  sphere:    { random: 0.39, square: 0.47, hexagonal: 0.26 },
+  ellipsoid: { random: 0.36 },
+  rod:       { random: 0.45 },
+  nugget:    { random: 0.41 },
+};
+const SPHERICITY = { sphere: 1.0, ellipsoid: 0.92, rod: 0.75, nugget: 0.90 };
+const SHAPES = ["sphere", "ellipsoid", "rod", "nugget"];
+
+// unit helpers (work internally in µm, µm², µm³)
+const UM3_PER_UL = 1e9;
+const UM3_PER_PL = 1e3;
+
+function fmt(x, digits = 3) {
+  if (!isFinite(x)) return "—";
+  if (x !== 0 && (Math.abs(x) >= 1e5 || Math.abs(x) < 1e-3)) return x.toExponential(2);
+  return Number(x.toPrecision(digits)).toLocaleString();
+}
+
+// numerically-stable coth for effectiveness factor
+const coth = (x) => (1 + Math.exp(-2 * x)) / (1 - Math.exp(-2 * x));
+
+function GranularHydrogelModel() {
+  // ---- structural inputs ----
+  const [d, setD] = useState(100);          // mean particle diameter, µm
+  const [shape, setShape] = useState("sphere");
+  const [packing, setPacking] = useState("random");
+  const [sigma, setSigma] = useState(0);    // polydispersity std, µm
+  const [volUL, setVolUL] = useState(10);   // scaffold volume, µL
+
+  // ---- transport inputs ----
+  const [substrate, setSubstrate] = useState("glucose"); // sets diffusivity preset
+  const [k, setK] = useState(10);           // effective 1st-order consumption rate, 1/s
+
+  const packOptions = Object.keys(VVF_TABLE[shape]);
+  const effPacking = packOptions.includes(packing) ? packing : packOptions[0];
+
+  // ---------- STRUCTURAL derived quantities ----------
+  const s = useMemo(() => {
+    const vvf = VVF_TABLE[shape][effPacking];
+    const solidFrac = 1 - vvf;
+    const psi = SPHERICITY[shape];
+
+    // equivalent-sphere convention (Riley's "comparable diameter"); polydispersity via moments
+    const Ed3 = Math.pow(d, 3) + 3 * d * sigma * sigma;         // E[d^3], normal dist
+    const Ed2 = d * d + sigma * sigma;                          // E[d^2]
+    const Vp = (Math.PI / 6) * Ed3;                             // mean particle volume, µm³
+    const Ap = (Math.PI * Ed2) / psi;                           // mean particle surface area, µm²
+
+    const Vscaf = volUL * UM3_PER_UL;                           // µm³
+    const solidVol = solidFrac * Vscaf;
+    const voidVol = vvf * Vscaf;                                // µm³
+    const N = solidVol / Vp;                                    // particle count
+    const totalArea = N * Ap;                                   // µm²
+    const specSurf = totalArea / voidVol;                       // µm²/µm³ = 1/µm (per void volume)
+
+    // order-of-magnitude pore size (packed-bed hydraulic estimate); Riley cautions VVF alone
+    // can't fully describe pore geometry — treat as a rough guide only
+    const dPore = (2 / 3) * (vvf / (1 - vvf)) * d;
+
+    return {
+      vvf, solidFrac, Vp, Ap, voidVol, N,
+      perUL: N / volUL,
+      perPL: N / (Vscaf / UM3_PER_PL),
+      totalArea, specSurf, dPore,
+    };
+  }, [d, shape, effPacking, sigma, volUL]);
+
+  // ---------- FUNCTIONAL (single-particle transport) ----------
+  const t = useMemo(() => {
+    const D = substrate === "glucose" ? 4.0e-6 : 2.45e-5; // cm²/s, sphere interior (paper values)
+    const Rcm = (d / 2) * 1e-4;            // µm -> cm
+    const m = Math.sqrt(k / D);            // 1/cm
+    const phi = m * Rcm;                   // Thiele modulus (sphere modulus form)
+    const eta = phi < 1e-6 ? 1 : (3 / (phi * phi)) * (phi * coth(phi) - 1);
+    const penUM = (1 / m) * 1e4;           // penetration depth, µm
+    const tau = (Rcm * Rcm) / D;           // characteristic diffusion time, s
+    const regime = phi < 1 ? "reaction-limited" : phi > 3 ? "diffusion-limited" : "mixed";
+
+    // exact first-order radial profile C(r)/C_s, stable form (r<=R)
+    const profile = (mm, RR) => {
+      const pts = [];
+      for (let i = 0; i <= 60; i++) {
+        const rho = i / 60;               // r/R
+        let val;
+        if (i === 0) {
+          const x = mm * RR;
+          val = x / Math.sinh(x);
+        } else {
+          const r = rho * RR;
+          val =
+            (1 / rho) *
+            Math.exp(mm * (r - RR)) *
+            (1 - Math.exp(-2 * mm * r)) /
+            (1 - Math.exp(-2 * mm * RR));
+        }
+        pts.push({ rho, val: Math.max(0, Math.min(1, val)) });
+      }
+      return pts;
+    };
+    const mGlu = Math.sqrt(k / 4.0e-6);
+    const mOx = Math.sqrt(k / 2.45e-5);
+    return {
+      D, phi, eta, penUM, tau, regime,
+      glucose: profile(mGlu, Rcm),
+      oxygen: profile(mOx, Rcm),
+    };
+  }, [d, k, substrate]);
+
+  return (
+    <div style={{ background: C.paper, color: C.ink, minHeight: "100%", padding: "20px",
+      fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
+      <style>{`
+        .ghm-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+        input[type=range]{ -webkit-appearance:none; appearance:none; height:3px; background:${C.line};
+          border-radius:3px; outline:none; width:100%; }
+        input[type=range]::-webkit-slider-thumb{ -webkit-appearance:none; height:16px; width:16px;
+          border-radius:50%; background:${C.ink}; cursor:pointer; border:2px solid ${C.paper}; }
+        input[type=range]::-moz-range-thumb{ height:14px; width:14px; border-radius:50%;
+          background:${C.ink}; cursor:pointer; border:2px solid ${C.paper}; }
+        .ghm-seg{ border:1px solid ${C.line}; background:${C.panel}; color:${C.sub};
+          padding:5px 10px; font-size:12px; cursor:pointer; letter-spacing:.02em; }
+        .ghm-seg[data-on="true"]{ background:${C.ink}; color:${C.paper}; border-color:${C.ink}; }
+        select{ border:1px solid ${C.line}; background:${C.panel}; color:${C.ink}; padding:6px 8px;
+          font-size:13px; border-radius:4px; }
+        @media (max-width:820px){ .ghm-grid{ grid-template-columns:1fr !important; } }
+      `}</style>
+
+      {/* header */}
+      <div style={{ borderBottom: `2px solid ${C.ink}`, paddingBottom: 10, marginBottom: 18 }}>
+        <div className="ghm-mono" style={{ fontSize: 11, letterSpacing: ".18em", color: C.sub }}>
+          GRANULAR HYDROGEL SCAFFOLD · FIRST-DRAFT MODEL
+        </div>
+        <div style={{ fontSize: 25, fontWeight: 650, marginTop: 4, letterSpacing: "-.01em" }}>
+          Packing structure &amp; single-particle transport
+        </div>
+      </div>
+
+      <div className="ghm-grid" style={{ display: "grid", gridTemplateColumns: "300px 1fr", gap: 18 }}>
+        {/* ---------------- CONTROLS ---------------- */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+          <Panel title="01 · Particle">
+            <Field label="Mean diameter" value={`${d} µm`}>
+              <input type="range" min={10} max={150} step={1} value={d}
+                onChange={(e) => setD(+e.target.value)} />
+            </Field>
+            <Field label="Polydispersity σ" value={`${sigma} µm`}>
+              <input type="range" min={0} max={25} step={1} value={sigma}
+                onChange={(e) => setSigma(+e.target.value)} />
+            </Field>
+            <Row label="Shape">
+              <select value={shape} onChange={(e) => { setShape(e.target.value);
+                const ok = Object.keys(VVF_TABLE[e.target.value]);
+                if (!ok.includes(packing)) setPacking(ok[0]); }}>
+                {SHAPES.map((x) => <option key={x} value={x}>{x}</option>)}
+              </select>
+            </Row>
+            <Row label="Packing">
+              <select value={effPacking} onChange={(e) => setPacking(e.target.value)}
+                disabled={packOptions.length === 1}>
+                {packOptions.map((x) => <option key={x} value={x}>{x}</option>)}
+              </select>
+            </Row>
+            {packOptions.length === 1 &&
+              <Note>Square / hexagonal reference values are only defined for spheres.</Note>}
+          </Panel>
+
+          <Panel title="02 · Scaffold">
+            <Field label="Total volume" value={`${volUL} µL`}>
+              <input type="range" min={1} max={100} step={1} value={volUL}
+                onChange={(e) => setVolUL(+e.target.value)} />
+            </Field>
+          </Panel>
+
+          <Panel title="03 · Transport (one particle)">
+            <Row label="Substrate">
+              <div style={{ display: "flex" }}>
+                {["glucose", "oxygen"].map((x) =>
+                  <button key={x} className="ghm-seg" data-on={substrate === x}
+                    style={{ borderRadius: x === "glucose" ? "4px 0 0 4px" : "0 4px 4px 0" }}
+                    onClick={() => setSubstrate(x)}>{x}</button>)}
+              </div>
+            </Row>
+            <Field label="Consumption rate k" value={`${k} s⁻¹`}>
+              <input type="range" min={0.5} max={60} step={0.5} value={k}
+                onChange={(e) => setK(+e.target.value)} />
+            </Field>
+            <Note>Diffusivity is preset from the paper: glucose 4·10⁻⁶, oxygen 2.45·10⁻⁵ cm²·s⁻¹.</Note>
+          </Panel>
+        </div>
+
+        {/* ---------------- OUTPUTS ---------------- */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+          {/* viewport + key structural metrics */}
+          <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 18, alignItems: "stretch" }}
+            className="ghm-grid">
+            <Viewport d={d} shape={shape} packing={effPacking} sigma={sigma} vvf={s.vvf} />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <Metric big label="Void volume fraction" value={`${(s.vvf * 100).toFixed(0)}%`}
+                accent={C.magenta} sub={`${effPacking} · ${shape}`} />
+              <Metric big label="Particles in scaffold" value={fmt(s.N, 3)}
+                accent={C.green} sub={`${fmt(s.perUL, 3)} / µL`} />
+              <Metric label="Void volume" value={`${fmt(s.voidVol / UM3_PER_UL, 3)} µL`} />
+              <Metric label="Solid fraction" value={`${(s.solidFrac * 100).toFixed(0)}%`} />
+              <Metric label="Particle volume" value={`${fmt(s.Vp, 3)} µm³`} />
+              <Metric label="Particle area" value={`${fmt(s.Ap, 3)} µm²`} />
+              <Metric label="Total surface area" value={`${fmt(s.totalArea / 1e6, 3)} mm²`} />
+              <Metric label="Est. pore size ⚠" value={`≈ ${fmt(s.dPore, 2)} µm`} />
+            </div>
+          </div>
+
+          {/* transport */}
+          <Panel title="Single-particle substrate penetration">
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 220px", gap: 16 }} className="ghm-grid">
+              <ProfilePlot glucose={t.glucose} oxygen={t.oxygen} />
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, alignContent: "start" }}>
+                <Metric label="Thiele modulus φ" value={fmt(t.phi, 3)} accent={C.amber} />
+                <Metric label="Effectiveness η" value={fmt(t.eta, 3)} />
+                <Metric label="Penetration depth" value={`${fmt(t.penUM, 2)} µm`} />
+                <Metric label="Response time" value={`${fmt(t.tau, 2)} s`} />
+                <div style={{ gridColumn: "1 / 3" }}>
+                  <Metric label={`Regime (${substrate})`} value={t.regime} accent={
+                    t.regime === "diffusion-limited" ? C.magenta : t.regime === "reaction-limited" ? C.green : C.amber} />
+                </div>
+              </div>
+            </div>
+            <Note>
+              φ&lt;1 → substrate fills the particle (reaction-limited); φ&gt;3 → thin reactive shell,
+              interior starved (diffusion-limited). Slower glucose penetrates less than oxygen — the
+              contrast that lets these particles report glucose via local oxygen.
+            </Note>
+          </Panel>
+
+          <Note>
+            <b>Assumptions.</b> VVF values are Riley et al.'s reported random/ordered-packing averages;
+            monodisperse VVF is ~diameter-independent, so changing size mainly changes count, not VVF.
+            Particle volume uses the equivalent-sphere ("comparable diameter") convention with a shape
+            sphericity for area; polydispersity enters through E[d³]=d³+3dσ². The pore-size figure (⚠)
+            is a packed-bed order-of-magnitude estimate — Riley's central point is that VVF alone can't
+            pin down pore geometry. Transport is a steady-state first-order sphere model (exact analytic
+            profile), a simplification of the two-substrate enzyme kinetics in Brown &amp; McShane.
+          </Note>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- small components ---------------- */
+function Panel({ title, children }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 6, padding: 14 }}>
+      <div className="ghm-mono" style={{ fontSize: 10.5, letterSpacing: ".14em", color: C.sub, marginBottom: 12 }}>
+        {title.toUpperCase()}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 13 }}>{children}</div>
+    </div>
+  );
+}
+function Field({ label, value, children }) {
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 7, fontSize: 12.5 }}>
+        <span style={{ color: C.sub }}>{label}</span>
+        <span className="ghm-mono" style={{ fontWeight: 600 }}>{value}</span>
+      </div>
+      {children}
+    </div>
+  );
+}
+function Row({ label, children }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <span style={{ color: C.sub, fontSize: 12.5 }}>{label}</span>
+      {children}
+    </div>
+  );
+}
+function Note({ children }) {
+  return <div style={{ fontSize: 11.5, lineHeight: 1.5, color: C.sub }}>{children}</div>;
+}
+function Metric({ label, value, sub, accent, big }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 6,
+      padding: big ? "12px 13px" : "10px 12px", borderLeft: accent ? `3px solid ${accent}` : `1px solid ${C.line}` }}>
+      <div style={{ fontSize: 10.5, color: C.sub, textTransform: "uppercase", letterSpacing: ".06em" }}>{label}</div>
+      <div className="ghm-mono" style={{ fontSize: big ? 26 : 17, fontWeight: 650, marginTop: 3 }}>{value}</div>
+      {sub && <div className="ghm-mono" style={{ fontSize: 11, color: C.sub, marginTop: 1 }}>{sub}</div>}
+    </div>
+  );
+}
+
+/* ---------------- packing viewport (schematic) ---------------- */
+function Viewport({ d, shape, packing, sigma, vvf }) {
+  const FIELD = 480;                 // fixed field of view, µm — bigger particles => fewer circles
+  const SZ = 260, scale = SZ / FIELD;
+  const items = useMemo(() => {
+    const out = [];
+    const step = d;                                    // grid spacing ~ one diameter
+    const hex = packing === "hexagonal";
+    const rowH = hex ? d * 0.9 : d * 1.02;
+    let row = 0;
+    // deterministic pseudo-random for stable render
+    let seed = 7;
+    const rnd = () => { seed = (seed * 9301 + 49297) % 233280; return seed / 233280; };
+    for (let y = step * 0.6; y < FIELD; y += rowH, row++) {
+      const off = hex && row % 2 ? step / 2 : 0;
+      for (let x = step * 0.6 + off; x < FIELD; x += step) {
+        let cx = x, cy = y, rr = d / 2;
+        if (packing === "random") { cx += (rnd() - 0.5) * d * 0.5; cy += (rnd() - 0.5) * d * 0.5;
+          if (rnd() < 0.12) continue; }
+        if (sigma > 0) rr = Math.max(d * 0.25, (d + (rnd() - 0.5) * 2 * sigma) / 2);
+        if (out.length < 500) out.push({ cx: cx * scale, cy: cy * scale, r: rr * scale });
+      }
+    }
+    return out;
+  }, [d, shape, packing, sigma]);
+
+  const shapeEl = (it, i) => {
+    const common = { fill: "url(#glow)", stroke: C.green, strokeWidth: Math.max(0.6, it.r * 0.08), opacity: 0.95 };
+    if (shape === "rod")
+      return <rect key={i} x={it.cx - it.r} y={it.cy - it.r * 0.45} width={it.r * 2} height={it.r * 0.9}
+        rx={it.r * 0.45} transform={`rotate(${(i * 47) % 180} ${it.cx} ${it.cy})`} {...common} />;
+    if (shape === "ellipsoid")
+      return <ellipse key={i} cx={it.cx} cy={it.cy} rx={it.r} ry={it.r * 0.72}
+        transform={`rotate(${(i * 63) % 180} ${it.cx} ${it.cy})`} {...common} />;
+    if (shape === "nugget")
+      return <ellipse key={i} cx={it.cx} cy={it.cy} rx={it.r} ry={it.r * 0.85}
+        transform={`rotate(${(i * 37) % 180} ${it.cx} ${it.cy})`} {...common} />;
+    return <circle key={i} cx={it.cx} cy={it.cy} r={it.r} {...common} />;
+  };
+
+  return (
+    <div style={{ background: C.dark, borderRadius: 6, padding: 10, display: "flex", flexDirection: "column" }}>
+      <div className="ghm-mono" style={{ fontSize: 10, letterSpacing: ".14em", color: "#6f7a72", marginBottom: 6 }}>
+        CROSS-SECTION · {FIELD} µm FIELD
+      </div>
+      <svg viewBox={`0 0 ${SZ} ${SZ}`} width="100%" style={{ borderRadius: 4, background: "#070a09" }}>
+        <defs>
+          <radialGradient id="glow" cx="45%" cy="42%" r="60%">
+            <stop offset="0%" stopColor={C.magenta} stopOpacity="0.55" />
+            <stop offset="70%" stopColor={C.magenta} stopOpacity="0.18" />
+            <stop offset="100%" stopColor={C.magenta} stopOpacity="0.05" />
+          </radialGradient>
+        </defs>
+        <rect x="0" y="0" width={SZ} height={SZ} fill="#080c0a" />
+        {items.map(shapeEl)}
+      </svg>
+      <div className="ghm-mono" style={{ fontSize: 10, color: "#6f7a72", marginTop: 6, textAlign: "center" }}>
+        {items.length} shown · void ≈ {(vvf * 100).toFixed(0)}%
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- radial concentration profile ---------------- */
+function ProfilePlot({ glucose, oxygen }) {
+  const W = 380, H = 200, pad = 34;
+  const px = (rho) => pad + rho * (W - pad - 8);
+  const py = (v) => H - pad - v * (H - pad - 12);
+  const path = (pts) => pts.map((p, i) => `${i ? "L" : "M"}${px(p.rho).toFixed(1)},${py(p.val).toFixed(1)}`).join(" ");
+  const grid = [0, 0.25, 0.5, 0.75, 1];
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%">
+      {grid.map((g) => (
+        <g key={g}>
+          <line x1={px(g)} y1={py(0)} x2={px(g)} y2={py(1)} stroke={C.line} strokeWidth="0.5" />
+          <text x={px(g)} y={H - pad + 14} fontSize="9" fill={C.sub} textAnchor="middle" className="ghm-mono">{g}</text>
+        </g>
+      ))}
+      {grid.map((g) => (
+        <g key={"y" + g}>
+          <line x1={pad} y1={py(g)} x2={W - 8} y2={py(g)} stroke={C.line} strokeWidth="0.5" />
+          <text x={pad - 6} y={py(g) + 3} fontSize="9" fill={C.sub} textAnchor="end" className="ghm-mono">{g}</text>
+        </g>
+      ))}
+      <path d={path(oxygen)} fill="none" stroke={C.green} strokeWidth="2.2" />
+      <path d={path(glucose)} fill="none" stroke={C.magenta} strokeWidth="2.2" />
+      <text x={W - 12} y={16} fontSize="10" fill={C.green} textAnchor="end" className="ghm-mono">oxygen</text>
+      <text x={W - 12} y={30} fontSize="10" fill={C.magenta} textAnchor="end" className="ghm-mono">glucose</text>
+      <text x={(W) / 2} y={H - 4} fontSize="9.5" fill={C.sub} textAnchor="middle">r / R  (center → surface)</text>
+      <text x={12} y={H / 2} fontSize="9.5" fill={C.sub} textAnchor="middle"
+        transform={`rotate(-90 12 ${H / 2})`}>C / C_surface</text>
+    </svg>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<GranularHydrogelModel />);
+  </script>
+</body>
+</html>
